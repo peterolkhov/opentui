@@ -1,0 +1,319 @@
+name: new104 unchanged OpenTUI Input before
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/observe-input-keybindings104]
+permissions:
+  contents: read
+jobs:
+  before:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - name: Checkout whole pinned upstream
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: anomalyco/opentui
+          ref: ea1127e9bf4562cd0020bf6d421e806a222bd040
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Setup pinned Bun without cache writes
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.1
+          no-cache: true
+      - name: Capture untouched HEAD tree index and all tracked bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          new104_evidence="$RUNNER_TEMP/new104-evidence"
+          mkdir -p "$new104_evidence"
+          echo "NEW104_EVIDENCE=$new104_evidence" >> "$GITHUB_ENV"
+          cat > "$new104_evidence/guard.py" <<'NEW104_GUARD_PY'
+          import hashlib,json,os,pathlib,re,stat,subprocess,sys
+          root=pathlib.Path.cwd(); stage=sys.argv[1]; dest=pathlib.Path(os.environ['NEW104_EVIDENCE'])
+          def run(*args):return subprocess.check_output(args).decode().strip()
+          def digest(path):
+           h=hashlib.sha256()
+           with open(path,'rb') as f:
+            while b:=f.read(1024*1024):h.update(b)
+           return h.hexdigest()
+          def entry(path):
+           s=path.lstat()
+           if stat.S_ISLNK(s.st_mode):return ['symlink',os.readlink(path)]
+           if stat.S_ISREG(s.st_mode):return ['file',s.st_size,s.st_mode&0o777,digest(path)]
+           return ['other',s.st_mode]
+          expected_head='ea1127e9bf4562cd0020bf6d421e806a222bd040'
+          expected_tree='c9bf9451aeb57e6402a3668932459dd2a66d3c8e'
+          index_bytes=subprocess.check_output(['git','ls-files','--stage','-z'])
+          source={};blob_proof={};lfs=[]
+          for record in index_bytes.split(b'\0'):
+           if not record:continue
+           header,name=record.split(b'\t',1);mode,oid,stage_number=header.split()
+           if stage_number!=b'0':raise RuntimeError('nonzero index stage')
+           name=os.fsdecode(name);path=root/name;metadata=path.lstat()
+           if mode==b'120000':
+            if not stat.S_ISLNK(metadata.st_mode):raise RuntimeError('tracked symlink changed type: '+name)
+            raw=os.fsencode(os.readlink(path))
+           elif mode in (b'100644',b'100755'):
+            if not stat.S_ISREG(metadata.st_mode):raise RuntimeError('tracked regular file changed type: '+name)
+            actual_mode=b'100755' if metadata.st_mode&0o111 else b'100644'
+            if actual_mode!=mode:raise RuntimeError('tracked executable mode changed: '+name)
+            # Open after lstat with O_NOFOLLOW; regular contents must match the index blob independently.
+            fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+            with os.fdopen(fd,'rb') as stream:raw=stream.read()
+           else:raise RuntimeError('unsupported tracked Git mode: '+mode.decode()+' '+name)
+           actual_blob=hashlib.sha1(b'blob '+str(len(raw)).encode()+b'\0'+raw).hexdigest()
+           if actual_blob!=oid.decode():
+            pointer=subprocess.check_output(['git','cat-file','blob',oid.decode()])
+            match=re.fullmatch(rb'version https://git-lfs.github.com/spec/v1\noid sha256:([0-9a-f]{64})\nsize ([0-9]+)\n',pointer)
+            if not match or len(raw)!=int(match[2]) or hashlib.sha256(raw).hexdigest()!=match[1].decode():raise RuntimeError('tracked bytes differ from index: '+name)
+            lfs.append({'path':name,'pointer_blob':oid.decode(),'object_sha256':match[1].decode(),'object_size':len(raw),'hydrated':True})
+           elif raw.startswith(b'version https://git-lfs.github.com/spec/v1\n'):
+            lfs.append({'path':name,'pointer_blob':oid.decode(),'hydrated':False})
+           source[name]=entry(path);blob_proof[name]={'mode':mode.decode(),'index_blob':oid.decode(),'actual_blob':actual_blob}
+          index=hashlib.sha256(index_bytes).hexdigest()
+          data={'head':run('git','rev-parse','HEAD'),'tree':run('git','rev-parse','HEAD^{tree}'),'write_tree':run('git','write-tree'),'index':index,'tracked':source,'tracked_blob_proof':blob_proof,'lfs':lfs,'tracked_status':run('git','status','--porcelain','--untracked-files=no')}
+          if data['head']!=expected_head or data['tree']!=expected_tree or data['write_tree']!=expected_tree or data['tracked_status']:raise RuntimeError('pinned source/index/tree is not clean and API-bound')
+          print('NEW104_ORIGINAL_SOURCE',json.dumps({'stage':stage,'head':data['head'],'tree':data['tree'],'write_tree':data['write_tree'],'expected_tree':expected_tree,'index':index,'tracked_files':len(source),'blob_proof_sha256':hashlib.sha256(json.dumps(blob_proof,sort_keys=True).encode()).hexdigest(),'every_tracked_blob_and_mode_matches_index':True,'lfs':lfs}))
+          if stage!='source':
+           paths=[]
+           for current,dirs,files in os.walk(root):
+            dirs[:]=[d for d in dirs if d not in ['.git','.zig-cache']]
+            if 'node_modules' in dirs:paths.append(pathlib.Path(current)/'node_modules');dirs.remove('node_modules')
+           paths += [root/p for p in ['packages/native/lib','packages/native/zig-out','packages/native/.cache','packages/core/dist'] if (root/p).exists()]
+           consumed={}
+           for parent in paths:
+            for current,dirs,files in os.walk(parent,followlinks=False):
+             for name in files+dirs:
+              p=pathlib.Path(current)/name
+              if p.is_file() or p.is_symlink():consumed[str(p.relative_to(root))]=entry(p)
+           data['consumed']=consumed
+           data['tools']={}
+           for tool in ['bun','zig','python3']:
+            p=pathlib.Path(run('which',tool)).resolve();data['tools'][tool]={'realpath':str(p),'sha256':digest(p)}
+           # Resolve ELF-linked system libraries in the actual interpreter/native outputs too.
+           linked={}
+           binaries=[pathlib.Path(v['realpath']) for v in data['tools'].values()]
+           binaries += [root/p for p in consumed if p.endswith('.so') and not (root/p).is_symlink()]
+           for binary in binaries:
+            proc=subprocess.run(['ldd',str(binary)],capture_output=True,text=True)
+            if proc.returncode not in (0,1):raise RuntimeError('ldd failed for '+str(binary))
+            for line in proc.stdout.splitlines():
+             for word in line.split():
+              if word.startswith('/') and pathlib.Path(word).is_file():
+               dep=pathlib.Path(word).resolve();linked[str(dep)]={'sha256':digest(dep),'bytes':dep.stat().st_size}
+           data['system_linked_libraries']=linked
+          sourcefile=dest/'guard-source.json'
+          if stage=='source':sourcefile.write_text(json.dumps(data,sort_keys=True))
+          else:
+           before=json.loads(sourcefile.read_text())
+           for k in before:
+            if before[k]!=data[k]:raise RuntimeError('source guard changed: '+k)
+           if stage=='before':(dest/'guard-before.json').write_text(json.dumps(data,sort_keys=True))
+           else:
+            before=json.loads((dest/'guard-before.json').read_text())
+            for k in before:
+             if before[k]!=data[k]:
+              if isinstance(before[k],dict):print('CHANGED',k,[p for p in set(before[k])|set(data[k]) if before[k].get(p)!=data[k].get(p)])
+              raise RuntimeError('consumed source/runtime/build/dependency guard changed: '+k)
+           print('NEW104_GUARD',json.dumps({'stage':stage,'head':data['head'],'tree':data['tree'],'index':index,'tracked_files':len(source),'tracked_sha256':hashlib.sha256(json.dumps(source,sort_keys=True).encode()).hexdigest(),'consumed_files':len(data['consumed']),'consumed_sha256':hashlib.sha256(json.dumps(data['consumed'],sort_keys=True).encode()).hexdigest(),'tools':data['tools'],'unchanged':True}))
+          NEW104_GUARD_PY
+          NEW104_EVIDENCE="$new104_evidence" python3 "$new104_evidence/guard.py" source
+      - name: Install pinned Zig archive with upstream-declared hash; no cache upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(cat .zig-version)" = 0.17.0
+          archive="$RUNNER_TEMP/new104-zig.tar.xz"
+          curl -fL --connect-timeout 15 --max-time 300 https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz -o "$archive"
+          echo "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026  $archive" | sha256sum --check
+          tar -xJf "$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-0.17.0" >> "$GITHUB_PATH"
+          {
+            echo "ZIG_GLOBAL_CACHE_DIR=$RUNNER_TEMP/new104-zig-global"
+            echo "ZIG_LOCAL_CACHE_DIR=$RUNNER_TEMP/new104-zig-local"
+          } >> "$GITHUB_ENV"
+      - name: Install frozen dependencies and build native baseline from pinned source
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun --version
+          zig version
+          bun install --frozen-lockfile
+          (cd packages/core && bun run build:native && bun run build:lib)
+          python3 "$NEW104_EVIDENCE/guard.py" before
+      - name: Write external diagnostic driver core-before.ts
+        shell: bash
+        run: |
+          cat > packages/core/new104-before.ts <<'NEW104_PROBE'
+          import { InputRenderable, InputRenderableEvents, TextareaRenderable, setRenderableProp } from "./src/index.ts"
+          import { createTestRenderer } from "./src/testing.ts"
+          const records: any[] = []
+          const emit = (record: any) => { records.push(record); process.stdout.write(`NEW104_RAW ${JSON.stringify(record)}\n`) }
+          const shortcut = [{ name: "x", ctrl: true, action: "line-home" }] as const
+          const modes = ["default", "constructor-custom", "setter-custom", "setter-empty", "setter-null", "setter-undefined", "mapped-custom", "custom-submit", "override-return"]
+          for (const key of ["return", "linefeed", "kpenter"]) {
+            for (const mode of modes) {
+              let setup: any
+              let input: any
+              const events: any[] = []
+              const parsed: any[] = []
+              try {
+                setup = await createTestRenderer({ width: 40, height: 4, kittyKeyboard: key === "kpenter" })
+                input = new InputRenderable(setup.renderer, { width: 30, value: "hello", ...(mode === "constructor-custom" ? { keyBindings: [...shortcut] } : {}) })
+                setup.renderer.root.add(input)
+                input.focus()
+                input.on(InputRenderableEvents.CHANGE, (value: string) => events.push(["change", value]))
+                input.on(InputRenderableEvents.ENTER, (value: string) => events.push(["submit", value]))
+                setup.renderer.keyInput.on("keypress", (event: any) => parsed.push({ name: event.name, ctrl: event.ctrl }))
+                input.insertText("!")
+                if (mode === "setter-custom") input.keyBindings = [...shortcut]
+                if (mode === "setter-empty") input.keyBindings = []
+                if (mode === "setter-null") input.keyBindings = null
+                if (mode === "setter-undefined") input.keyBindings = undefined
+                if (mode === "mapped-custom") setRenderableProp(input, "keyBindings", [...shortcut], undefined)
+                if (mode === "custom-submit") input.keyBindings = [{ name: "s", ctrl: true, action: "submit" }]
+                if (mode === "override-return") input.keyBindings = [{ name: key, action: "line-home" }]
+                if (["constructor-custom", "setter-custom", "mapped-custom"].includes(mode)) {
+                  setup.mockInput.pressKey("x", { ctrl: true })
+                  await new Promise<void>((resolve) => setImmediate(resolve))
+                }
+                const before = { value: input.value, cursor: input.cursorOffset, events: [...events] }
+                if (mode === "custom-submit") setup.mockInput.pressKey("s", { ctrl: true })
+                else await setup.mockInput.pressKeys([key === "return" ? "\r" : key === "linefeed" ? "\n" : "\x1b[57414u"])
+                await new Promise<void>((resolve) => setImmediate(resolve))
+                emit({ suite: "core", mode, key, before, after: { value: input.value, cursor: input.cursorOffset, events }, parsed, error: null })
+              } catch (error: any) {
+                emit({ suite: "core", mode, key, error: { name: error.name, message: error.message, stack: error.stack } })
+              } finally {
+                try { setup?.renderer.destroy(); if (setup?.renderer.closed) await setup.renderer.closed } catch (error: any) { emit({ suite: "core-cleanup", mode, key, error: String(error) }) }
+              }
+            }
+          }
+          for (const key of ["return", "linefeed", "kpenter"]) {
+            let setup: any
+            try {
+              setup = await createTestRenderer({ width: 40, height: 4, kittyKeyboard: key === "kpenter" })
+              const textarea = new TextareaRenderable(setup.renderer, { width: 30, height: 3, initialValue: "hello" })
+              setup.renderer.root.add(textarea)
+              textarea.focus(); textarea.gotoBufferEnd(); textarea.keyBindings = [...shortcut]
+              const before = textarea.plainText
+              await setup.mockInput.pressKeys([key === "return" ? "\r" : key === "linefeed" ? "\n" : "\x1b[57414u"])
+              await new Promise<void>((resolve) => setImmediate(resolve))
+              emit({ suite: "textarea-control", key, before, after: textarea.plainText, error: null })
+            } catch (error: any) { emit({ suite: "textarea-control", key, error: { name: error.name, message: error.message } }) }
+            finally { try { setup?.renderer.destroy(); if (setup?.renderer.closed) await setup.renderer.closed } catch (error: any) { emit({ suite: "textarea-cleanup", key, error: String(error) }) } }
+          }
+          const results = records.filter((r) => r.suite === "core" && !r.error).map((r) => ({ suite: r.suite, mode: r.mode, key: r.key, contractPass: r.after.value === "hello!" && (r.mode === "override-return" ? r.after.events.length === 0 && r.after.cursor === 0 : JSON.stringify(r.after.events) === JSON.stringify([["change", "hello!"], ["submit", "hello!"]])), shortcutPass: !["constructor-custom", "setter-custom", "mapped-custom"].includes(r.mode) || r.before.cursor === 0 }))
+          process.stdout.write(`NEW104_ASSESS ${JSON.stringify({ suite: "core", runtimeErrors: records.filter((r) => r.error), results, textareaControls: records.filter((r) => r.suite === "textarea-control").map((r) => ({ key: r.key, contractPass: !r.error && r.after === "hello\n" })) })}\n`)
+          if (records.some((r) => r.error)) process.exitCode = 2
+          NEW104_PROBE
+      - name: Write external diagnostic driver react-before.ts
+        shell: bash
+        run: |
+          cat > packages/react/new104-before.ts <<'NEW104_PROBE'
+          import { act, createElement, createRef, useState } from "react"
+          import { InputRenderable } from "@opentui/core"
+          import { testRender } from "./src/test-utils.ts"
+          const records: any[] = []
+          const emit = (record: any) => { records.push(record); process.stdout.write(`NEW104_RAW ${JSON.stringify(record)}\n`) }
+          const shortcut = [{ name: "x", ctrl: true, action: "line-home" }]
+          for (const mode of ["absent", "initial-custom", "updated-custom", "removed-custom", "custom-submit"]) {
+            let setup: any
+            const ref = createRef<InputRenderable>()
+            const events: any[] = []
+            let update: any
+            try {
+              function App() {
+                const [bindings, setBindings] = useState<any>(mode === "initial-custom" || mode === "removed-custom" ? shortcut : mode === "custom-submit" ? [{ name: "s", ctrl: true, action: "submit" }] : undefined)
+                update = setBindings
+                return createElement("input", { ref, focused: true, value: "hello", width: 30, ...(bindings === undefined ? {} : { keyBindings: bindings }), onChange: (value: string) => events.push(["change", value]), onSubmit: (value: string) => events.push(["submit", value]) })
+              }
+              setup = await testRender(createElement(App), { width: 40, height: 4 })
+              if (mode === "updated-custom") act(() => update(shortcut))
+              if (mode === "removed-custom") act(() => update(undefined))
+              act(() => ref.current!.insertText("!"))
+              if (mode === "initial-custom" || mode === "updated-custom") act(() => setup.mockInput.pressKey("x", { ctrl: true }))
+              const before = { value: ref.current!.value, cursor: ref.current!.cursorOffset, events: [...events] }
+              act(() => mode === "custom-submit" ? setup.mockInput.pressKey("s", { ctrl: true }) : setup.mockInput.pressEnter())
+              await new Promise<void>((resolve) => setImmediate(resolve))
+              emit({ suite: "react-real-harness", mode, before, after: { value: ref.current!.value, cursor: ref.current!.cursorOffset, events }, error: null })
+            } catch (error: any) { emit({ suite: "react-real-harness", mode, error: { name: error.name, message: error.message, stack: error.stack } }) }
+            finally { try { act(() => setup?.renderer.destroy()); if (setup?.renderer.closed) await setup.renderer.closed } catch (error: any) { emit({ suite: "react-cleanup", mode, error: String(error) }) } }
+          }
+          process.stdout.write(`NEW104_ASSESS ${JSON.stringify({ suite: "react", runtimeErrors: records.filter((r) => r.error), results: records.filter((r) => !r.error).map((r) => ({ mode: r.mode, contractPass: r.after.value === "hello!" && JSON.stringify(r.after.events) === JSON.stringify([["change", "hello!"], ["submit", "hello!"]]), shortcutPass: !["initial-custom", "updated-custom"].includes(r.mode) || r.before.cursor === 0 })) })}\n`)
+          if (records.some((r) => r.error)) process.exitCode = 2
+          NEW104_PROBE
+      - name: Write external diagnostic driver solid-before.tsx
+        shell: bash
+        run: |
+          cat > packages/solid/new104-before.tsx <<'NEW104_PROBE'
+          import { testRender } from "./index.ts"
+          import { createSignal } from "solid-js"
+          import type { InputRenderable } from "@opentui/core"
+          const records: any[] = []
+          const emit = (record: any) => { records.push(record); process.stdout.write(`NEW104_RAW ${JSON.stringify(record)}\n`) }
+          const shortcut = [{ name: "x", ctrl: true, action: "line-home" }]
+          for (const mode of ["absent", "initial-custom", "updated-custom", "removed-custom", "custom-submit"]) {
+            let setup: any
+            let input: InputRenderable | undefined
+            const events: any[] = []
+            const [bindings, setBindings] = createSignal<any>(mode === "initial-custom" || mode === "removed-custom" ? shortcut : mode === "custom-submit" ? [{ name: "s", ctrl: true, action: "submit" }] : undefined)
+            try {
+              setup = await testRender(() => mode === "absent" ? <input ref={(node) => input = node} focused value="hello" width={30} onChange={(value) => events.push(["change", value])} onSubmit={(value) => events.push(["submit", value])} /> : <input ref={(node) => input = node} focused value="hello" width={30} keyBindings={bindings()} onChange={(value) => events.push(["change", value])} onSubmit={(value) => events.push(["submit", value])} />, { width: 40, height: 4 })
+              if (mode === "updated-custom") setBindings(shortcut)
+              if (mode === "removed-custom") setBindings(undefined)
+              input!.insertText("!")
+              if (mode === "initial-custom" || mode === "updated-custom") setup.mockInput.pressKey("x", { ctrl: true })
+              const before = { value: input!.value, cursor: input!.cursorOffset, events: [...events] }
+              if (mode === "custom-submit") setup.mockInput.pressKey("s", { ctrl: true })
+              else setup.mockInput.pressEnter()
+              await new Promise<void>((resolve) => setImmediate(resolve))
+              emit({ suite: "solid-real-jsx-harness", mode, before, after: { value: input!.value, cursor: input!.cursorOffset, events }, error: null })
+            } catch (error: any) { emit({ suite: "solid-real-jsx-harness", mode, error: { name: error.name, message: error.message, stack: error.stack } }) }
+            finally { try { setup?.renderer.destroy(); if (setup?.renderer.closed) await setup.renderer.closed } catch (error: any) { emit({ suite: "solid-cleanup", mode, error: String(error) }) } }
+          }
+          process.stdout.write(`NEW104_ASSESS ${JSON.stringify({ suite: "solid", runtimeErrors: records.filter((r) => r.error), results: records.filter((r) => !r.error).map((r) => ({ mode: r.mode, contractPass: r.after.value === "hello!" && JSON.stringify(r.after.events) === JSON.stringify([["change", "hello!"], ["submit", "hello!"]]), shortcutPass: !["initial-custom", "updated-custom"].includes(r.mode) || r.before.cursor === 0 })) })}\n`)
+          if (records.some((r) => r.error)) process.exitCode = 2
+          NEW104_PROBE
+      - name: Run actual core native public API and controls
+        shell: bash
+        run: |
+          set +e
+          (cd packages/core && bun new104-before.ts) 2>&1 | tee "$NEW104_EVIDENCE/core.log"
+          status=${PIPESTATUS[0]}
+          echo "NEW104_PROCESS core $status"
+          echo "$status" > "$NEW104_EVIDENCE/core.status"
+          exit 0
+      - name: Run real React harness initial and updated props
+        shell: bash
+        run: |
+          set +e
+          (cd packages/react && bun new104-before.ts) 2>&1 | tee "$NEW104_EVIDENCE/react.log"
+          status=${PIPESTATUS[0]}
+          echo "NEW104_PROCESS react $status"
+          echo "$status" > "$NEW104_EVIDENCE/react.status"
+          exit 0
+      - name: Run real Solid JSX compiler and test harness
+        shell: bash
+        run: |
+          set +e
+          (cd packages/solid && bun --preload ./scripts/preload.ts new104-before.tsx) 2>&1 | tee "$NEW104_EVIDENCE/solid.log"
+          status=${PIPESTATUS[0]}
+          echo "NEW104_PROCESS solid $status"
+          echo "$status" > "$NEW104_EVIDENCE/solid.status"
+          exit 0
+      - name: Verify unchanged source runtime builds dependencies and explicit statuses
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$NEW104_EVIDENCE/guard.py" after
+          python3 - <<'NEW104_STATUS'
+          import json,os,pathlib
+          p=pathlib.Path(os.environ['NEW104_EVIDENCE'])
+          status={k:(p/(k+'.status')).read_text().strip() if (p/(k+'.status')).exists() else 'MISSING' for k in ['core','react','solid']}
+          print('NEW104_STATUS',json.dumps(status))
+          if any(x!='0' for x in status.values()):raise SystemExit(2)
+          NEW104_STATUS
